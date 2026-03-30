@@ -46,6 +46,7 @@
   "dependencies": {
     "@material/material-color-utilities": "^0.3.0",
     "ajv": "^8.18.0",
+    "canvas": "^3.2.2",
     "compare-versions": "^6.1.1",
     "core-js": "^3.48.0",
     "crypto-js": "^4.2.0",

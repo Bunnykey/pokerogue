@@ -1,50 +1,18 @@
 // src/agent/runner.ts
-// Headless PokeRogue runner — boots game via test framework, then enters bridge loop
+// Headless PokeRogue runner — designed to run under vitest environment
+// which provides jsdom, canvas mocks, and all Phaser setup.
 //
-// Usage: npx vitest run src/agent/runner.ts
-// Or run directly with the test environment setup
+// Usage: npx vitest run src/agent/runner.test.ts
 
-import "vitest-canvas-mock";
-
-// Setup jsdom globals that Phaser needs (mimicking vitest.setup.ts)
-import { JSDOM } from "jsdom";
-
-const dom = new JSDOM("<!DOCTYPE html><html><body><canvas></canvas></body></html>", {
-  pretendToBeVisual: true,
-});
-const w = dom.window;
-for (const key of Object.getOwnPropertyNames(w)) {
-  if (!(key in globalThis)) {
-    try {
-      (globalThis as any)[key] = (w as any)[key];
-    } catch {}
-  }
-}
-(globalThis as any).window = w;
-(globalThis as any).document = w.document;
-
-// Mock matchMedia
-(globalThis as any).matchMedia = () => ({ matches: false });
-
-// Mock document.fonts
-Object.defineProperty(document, "fonts", {
-  writable: true,
-  value: { add: () => {}, load: () => Promise.resolve([]) },
-});
-
-// Mock navigator.getGamepads
-(navigator as any).getGamepads = () => [];
-
+// This file exports the main function; runner.test.ts calls it.
 import { BattleScene } from "#app/battle-scene";
-import { initializeGame } from "#app/init/init";
+import { globalScene, initGlobalScene } from "#app/global-scene";
+import { PhaseManager } from "#app/phase-manager";
 import Phaser from "phaser";
 import { startBridge } from "./bridge";
 
-async function main() {
-  process.stderr.write("[runner] Initializing...\n");
-
-  // Initialize game data (moves, species, etc.)
-  initializeGame();
+export async function runAgent(): Promise<void> {
+  process.stderr.write("[runner] Starting headless agent...\n");
 
   // Create headless Phaser game
   const phaserGame = new Phaser.Game({
@@ -54,14 +22,13 @@ async function main() {
     scene: [],
   });
 
-  // Store for bridge access
   (globalThis as any).__PHASER_GAME__ = phaserGame;
 
-  // Create and initialize BattleScene
+  // Create BattleScene
   const scene = new BattleScene();
   phaserGame.scene.add("battle", scene, true);
 
-  // Wait for scene to be ready
+  // Wait for scene to initialize
   await new Promise<void>(resolve => {
     const check = () => {
       if (scene.ui) {
@@ -73,13 +40,9 @@ async function main() {
     setTimeout(check, 500);
   });
 
-  process.stderr.write("[runner] Game scene ready, entering bridge loop\n");
-
-  // Enter the stdin/stdout bridge loop
+  process.stderr.write("[runner] Scene ready, starting bridge\n");
   startBridge();
-}
 
-main().catch(e => {
-  process.stderr.write(`[runner] Fatal: ${e.message}\n${e.stack}\n`);
-  process.exit(1);
-});
+  // Keep process alive
+  await new Promise(() => {});
+}

@@ -1,4 +1,5 @@
 // src/agent/bridge.ts
+// JSON-RPC bridge with PhaseInterceptor-style phase pump
 
 import { globalScene } from "#app/global-scene";
 import { Button } from "#enums/buttons";
@@ -7,11 +8,6 @@ import { readGameState } from "./state-reader";
 
 interface Command {
   cmd: string;
-  btn?: number;
-  n?: number;
-}
-
-interface Response {
   [key: string]: any;
 }
 
@@ -27,7 +23,130 @@ const BTN_MAP: Record<number, Button> = {
   16: Button.SLOW_DOWN,
 };
 
-async function handleCommand(cmd: Command): Promise<Response> {
+// UI modes that require player input (phase should pause here)
+const INTERACTIVE_UI_MODES = new Set([
+  2, // COMMAND
+  3, // FIGHT
+  4, // BALL
+  5, // TARGET_SELECT
+  6, // MODIFIER_SELECT
+  7, // SAVE_SLOT
+  8, // PARTY
+  10, // STARTER_SELECT
+  14, // CONFIRM
+  15, // OPTION_SELECT
+]);
+
+// ============================================================
+// Phase Pump — PhaseInterceptor pattern for headless mode
+// ============================================================
+
+let pumpInstalled = false;
+let phaseReady = false; // true when a new phase is loaded but not yet started
+
+/**
+ * Install the phase pump by replacing PhaseManager.startCurrentPhase.
+ * This gives us manual control over when each phase starts.
+ */
+function installPhasePump(): void {
+  if (pumpInstalled) {
+    return;
+  }
+  const pm = globalScene.phaseManager;
+  // Replace the private startCurrentPhase method
+  (pm as any).startCurrentPhase = () => {
+    phaseReady = true;
+  };
+  pumpInstalled = true;
+  process.stderr.write("[bridge] Phase pump installed\n");
+}
+
+/**
+ * Run the phase pump: start phases one at a time until an interactive UI mode
+ * is reached or maxPhases is exhausted. Yields to event loop between phases
+ * to let async callbacks (MockClock timers, Promise chains) fire.
+ */
+async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: number; phaseName: string }> {
+  const pm = globalScene.phaseManager;
+  let processed = 0;
+
+  for (let i = 0; i < maxPhases; i++) {
+    // First check: is the UI already interactive? (from a currently-running phase)
+    try {
+      const uiMode = globalScene.ui?.getMode() ?? 0;
+      if (INTERACTIVE_UI_MODES.has(uiMode)) {
+        const phase = pm.getCurrentPhase();
+        return {
+          phases: processed,
+          uiMode,
+          phaseName: phase?.phaseName || "none",
+        };
+      }
+    } catch {}
+
+    // Wait for a phase to be ready
+    if (!phaseReady) {
+      // Yield to let the current phase's async callbacks complete
+      for (let y = 0; y < 10; y++) {
+        await new Promise<void>(r => setTimeout(r, 2));
+        if (phaseReady) {
+          break;
+        }
+        // Also check if UI became interactive while waiting
+        try {
+          const uiMode = globalScene.ui?.getMode() ?? 0;
+          if (INTERACTIVE_UI_MODES.has(uiMode)) {
+            const phase = pm.getCurrentPhase();
+            return {
+              phases: processed,
+              uiMode,
+              phaseName: phase?.phaseName || "none",
+            };
+          }
+        } catch {}
+      }
+      if (!phaseReady) {
+        break;
+      }
+    }
+
+    // Start the phase
+    const phase = pm.getCurrentPhase();
+    if (!phase) {
+      break;
+    }
+    const phaseName = phase.phaseName || phase.constructor.name;
+
+    phaseReady = false;
+    try {
+      phase.start();
+    } catch (e: any) {
+      process.stderr.write(`[pump] ${phaseName} error: ${e.message}\n`);
+    }
+    processed++;
+    if (processed <= 20 || processed % 50 === 0) {
+      const m = globalScene.ui?.getMode() ?? -1;
+      process.stderr.write(`[pump] #${processed} ${phaseName} → ui=${m}\n`);
+    }
+
+    // Yield to event loop
+    await new Promise<void>(r => setTimeout(r, 1));
+  }
+
+  const uiMode = globalScene.ui?.getMode() ?? 0;
+  const currentPhase = pm.getCurrentPhase();
+  return {
+    phases: processed,
+    uiMode,
+    phaseName: currentPhase?.phaseName || "none",
+  };
+}
+
+// ============================================================
+// Command handler
+// ============================================================
+
+async function handleCommand(cmd: Command): Promise<Record<string, any>> {
   switch (cmd.cmd) {
     case "get_state":
       return readGameState();
@@ -57,8 +176,16 @@ async function handleCommand(cmd: Command): Promise<Response> {
       }
     }
 
+    case "pump": {
+      // Phase pump: advance up to N phases, stopping at interactive UI
+      const max = cmd.n ?? 200;
+      installPhasePump();
+      const result = await phasePump(max);
+      return { ok: true, ...result };
+    }
+
     case "run": {
-      // Run N iterations with batched stepping and event loop yields
+      // Legacy: step game loop N frames with event loop yields
       const n = cmd.n ?? 60;
       const game = (globalThis as any).__PHASER_GAME__;
       const scene = globalScene;
@@ -73,7 +200,6 @@ async function handleCommand(cmd: Command): Promise<Response> {
             frames++;
           } catch {}
         }
-        // Yield after each batch — let async phase callbacks fire
         await new Promise<void>(r => setTimeout(r, 5));
       }
       return { ok: true, frames };
@@ -83,7 +209,6 @@ async function handleCommand(cmd: Command): Promise<Response> {
       return { ok: true, pong: true };
 
     case "eval": {
-      // Execute code in the game context (mirrors page.evaluate)
       try {
         const fn = new Function("globalScene", "scene", "game", cmd.code || "");
         const game = (globalThis as any).__PHASER_GAME__;
@@ -102,7 +227,12 @@ async function handleCommand(cmd: Command): Promise<Response> {
     default:
       return { ok: false, error: `unknown command: ${cmd.cmd}` };
   }
+  return { ok: false, error: "unreachable" };
 }
+
+// ============================================================
+// Bridge I/O
+// ============================================================
 
 export function startBridge(): void {
   const rl = createInterface({
@@ -121,12 +251,10 @@ export function startBridge(): void {
     processing = true;
     const line = queue.shift()!;
     try {
-      process.stderr.write(`[bridge] cmd: ${line.slice(0, 80)}\n`);
       const cmd: Command = JSON.parse(line);
       const response = await handleCommand(cmd);
       process.stdout.write(JSON.stringify(response) + "\n");
     } catch (e: any) {
-      process.stderr.write(`[bridge] error: ${e.message}\n`);
       process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + "\n");
     }
     processing = false;
@@ -138,15 +266,10 @@ export function startBridge(): void {
     processNext();
   });
 
-  // Don't exit on close — async commands may still be pending.
-  // The "quit" command handles explicit exit.
-  rl.on("close", () => {
-    // stdin closed (pipe ended). Allow pending async commands to finish.
-    // Process will exit when the event loop is empty or via "quit" command.
-  });
+  rl.on("close", () => {});
 
-  // Keep the event loop alive (stdin pipe close removes the readline handle)
-  const _keepAlive = setInterval(() => {}, 1 << 30);
+  // Keep event loop alive
+  setInterval(() => {}, 1 << 30);
 
   // Signal ready
   process.stdout.write(JSON.stringify({ ready: true }) + "\n");

@@ -58,17 +58,23 @@ async function handleCommand(cmd: Command): Promise<Response> {
     }
 
     case "run": {
-      // Alias for tick — run N synchronous game loop steps
-      const n = cmd.n ?? 100;
+      // Run N iterations with batched stepping and event loop yields
+      const n = cmd.n ?? 60;
       const game = (globalThis as any).__PHASER_GAME__;
+      const scene = globalScene;
       let frames = 0;
-      for (let i = 0; i < n; i++) {
-        try {
-          if (game?.loop) {
-            game.loop.step(performance.now());
+      const BATCH = 10;
+      for (let b = 0; b < n; b += BATCH) {
+        const end = Math.min(b + BATCH, n);
+        for (let i = b; i < end; i++) {
+          try {
+            game?.loop?.step(performance.now());
+            scene?.update?.();
             frames++;
-          }
-        } catch {}
+          } catch {}
+        }
+        // Yield after each batch — let async phase callbacks fire
+        await new Promise<void>(r => setTimeout(r, 5));
       }
       return { ok: true, frames };
     }

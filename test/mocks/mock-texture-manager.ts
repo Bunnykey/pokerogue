@@ -2,6 +2,7 @@ import type { MockGameObject } from "#test/mocks/mock-game-object";
 import { MockVideoGameObject } from "#test/mocks/mock-video-game-object";
 import { MockBBCodeText } from "#test/mocks/mocks-container/mock-bbcode-text";
 import { MockContainer } from "#test/mocks/mocks-container/mock-container";
+import { MockGraphics } from "#test/mocks/mocks-container/mock-graphics";
 import { MockImage } from "#test/mocks/mocks-container/mock-image";
 import { MockInputText } from "#test/mocks/mocks-container/mock-input-text";
 import { MockNineslice } from "#test/mocks/mocks-container/mock-nineslice";
@@ -39,6 +40,7 @@ export class MockTextureManager {
       rexInputText: this.rexInputText.bind(this),
       bitmapText: this.text.bind(this),
       displayList: this.displayList,
+      graphics: this.graphicsObj.bind(this),
       video: () => new MockVideoGameObject(),
     };
   }
@@ -117,6 +119,12 @@ export class MockTextureManager {
     const text = new MockInputText(this, x, y, w, h, content, styleOptions);
     this.list.push(text);
     return text;
+  }
+
+  graphicsObj(config?: any) {
+    const g = new MockGraphics(this, config || {});
+    this.list.push(g);
+    return g;
   }
 
   polygon(x, y, content, fillColor, fillAlpha) {

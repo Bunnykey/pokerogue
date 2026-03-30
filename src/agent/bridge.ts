@@ -27,7 +27,7 @@ const BTN_MAP: Record<number, Button> = {
   16: Button.SLOW_DOWN,
 };
 
-function handleCommand(cmd: Command): Response {
+async function handleCommand(cmd: Command): Promise<Response> {
   switch (cmd.cmd) {
     case "get_state":
       return readGameState();
@@ -57,8 +57,37 @@ function handleCommand(cmd: Command): Response {
       }
     }
 
+    case "run": {
+      // Alias for tick — run N synchronous game loop steps
+      const n = cmd.n ?? 100;
+      const game = (globalThis as any).__PHASER_GAME__;
+      let frames = 0;
+      for (let i = 0; i < n; i++) {
+        try {
+          if (game?.loop) {
+            game.loop.step(performance.now());
+            frames++;
+          }
+        } catch {}
+      }
+      return { ok: true, frames };
+    }
+
     case "ping":
       return { ok: true, pong: true };
+
+    case "eval": {
+      // Execute code in the game context (mirrors page.evaluate)
+      try {
+        const fn = new Function("globalScene", "scene", "game", cmd.code || "");
+        const game = (globalThis as any).__PHASER_GAME__;
+        const scene = globalScene;
+        const result = fn(globalScene, scene, game);
+        return { ok: true, result: result ?? null };
+      } catch (e: any) {
+        return { ok: false, error: e.message };
+      }
+    }
 
     case "quit":
       process.exit(0);
@@ -76,17 +105,42 @@ export function startBridge(): void {
     terminal: false,
   });
 
-  rl.on("line", (line: string) => {
+  let processing = false;
+  const queue: string[] = [];
+
+  const processNext = async () => {
+    if (processing || queue.length === 0) {
+      return;
+    }
+    processing = true;
+    const line = queue.shift()!;
     try {
+      process.stderr.write(`[bridge] cmd: ${line.slice(0, 80)}\n`);
       const cmd: Command = JSON.parse(line);
-      const response = handleCommand(cmd);
+      const response = await handleCommand(cmd);
       process.stdout.write(JSON.stringify(response) + "\n");
     } catch (e: any) {
+      process.stderr.write(`[bridge] error: ${e.message}\n`);
       process.stdout.write(JSON.stringify({ ok: false, error: e.message }) + "\n");
     }
+    processing = false;
+    processNext();
+  };
+
+  rl.on("line", (line: string) => {
+    queue.push(line);
+    processNext();
   });
 
-  rl.on("close", () => process.exit(0));
+  // Don't exit on close — async commands may still be pending.
+  // The "quit" command handles explicit exit.
+  rl.on("close", () => {
+    // stdin closed (pipe ended). Allow pending async commands to finish.
+    // Process will exit when the event loop is empty or via "quit" command.
+  });
+
+  // Keep the event loop alive (stdin pipe close removes the readline handle)
+  const _keepAlive = setInterval(() => {}, 1 << 30);
 
   // Signal ready
   process.stdout.write(JSON.stringify({ ready: true }) + "\n");

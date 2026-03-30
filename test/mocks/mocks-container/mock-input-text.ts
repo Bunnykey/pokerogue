@@ -21,4 +21,8 @@ export class MockInputText extends MockText {
   resize(_width: number, _height: number) {}
 
   setElement(_element, _style, _innerText) {}
+
+  setFocus() {}
+
+  setBlur() {}
 }

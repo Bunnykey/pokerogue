@@ -9,6 +9,10 @@ export class MockGameObjectCreator {
     this.textureManager = textureManager;
   }
 
+  image(_config?: any) {
+    return this.textureManager.add.image(0, 0, "");
+  }
+
   graphics(config: any) {
     return new MockGraphics(this.textureManager, config);
   }

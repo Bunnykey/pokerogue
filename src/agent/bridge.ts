@@ -57,8 +57,38 @@ function installPhasePump(): void {
   (pm as any).startCurrentPhase = () => {
     phaseReady = true;
   };
+
+  // Patch UI to skip transition fades — these create nested async chains
+  // (fadeOut → delayedCall → doSetMode → fadeIn) that stall the pump.
+  // By skipping transitions, setMode resolves synchronously.
+  const ui = globalScene.ui;
+  (ui as any).setModeInternal = (
+    mode: number,
+    clear: boolean,
+    _forceTransition: boolean,
+    chainMode: boolean,
+    args: any[],
+  ): Promise<void> => {
+    // Always call with forceTransition=false AND skip the fade path
+    return new Promise<void>(resolve => {
+      if (ui.mode === mode) {
+        resolve();
+        return;
+      }
+      if (clear) {
+        ui.getHandler()?.clear?.();
+      }
+      if (chainMode && ui.mode && !clear) {
+        (ui as any).modeChain.push(ui.mode);
+      }
+      (ui as any).mode = mode;
+      ui.getHandler()?.show?.(args);
+      resolve();
+    });
+  };
+
   pumpInstalled = true;
-  process.stderr.write("[bridge] Phase pump installed\n");
+  process.stderr.write("[bridge] Phase pump + sync UI installed\n");
 }
 
 /**
@@ -87,8 +117,9 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
     // Wait for a phase to be ready
     if (!phaseReady) {
       // Yield to let the current phase's async callbacks complete
-      for (let y = 0; y < 10; y++) {
-        await new Promise<void>(r => setTimeout(r, 2));
+      // Needs 15+ yields for deep async chains (fadeOut → delayedCall → .then → resolve)
+      for (let y = 0; y < 30; y++) {
+        await new Promise<void>(r => setTimeout(r, 3));
         if (phaseReady) {
           break;
         }
@@ -117,6 +148,32 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
     }
     const phaseName = phase.phaseName || phase.constructor.name;
 
+    // Patch DamageAnimPhase to skip flash animation — the flashTimer depends on
+    // MockClock ticks which may not fire reliably in the pump loop.
+    // Patch DamageAnimPhase: skip flash animation, use instant updateInfo
+    if (phaseName === "DamageAnimPhase") {
+      (phase as any).applyDamage = function (this: any) {
+        if (this.amount) {
+          globalScene.damageNumberHandler?.add?.(this.getPokemon(), this.amount, this.damageResult, this.critical);
+        }
+        // updateInfo(true) → instant tween → resolve synchronously via mock → .then fires
+        this.getPokemon()
+          .updateInfo(true)
+          .then(() => this.end());
+      };
+    }
+
+    // Force CommandPhase to always prompt the player (clear move queue to prevent auto-skip)
+    if (phaseName === "CommandPhase") {
+      try {
+        const fieldIdx = (phase as any).fieldIndex ?? 0;
+        const playerPokemon = globalScene.getPlayerField()[fieldIdx];
+        if (playerPokemon?.getMoveQueue) {
+          playerPokemon.getMoveQueue().length = 0;
+        }
+      } catch {}
+    }
+
     phaseReady = false;
     try {
       phase.start();
@@ -124,13 +181,32 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
       process.stderr.write(`[pump] ${phaseName} error: ${e.message}\n`);
     }
     processed++;
-    if (processed <= 20 || processed % 50 === 0) {
-      const m = globalScene.ui?.getMode() ?? -1;
-      process.stderr.write(`[pump] #${processed} ${phaseName} → ui=${m}\n`);
+    const postUi = globalScene.ui?.getMode() ?? -1;
+    if (processed <= 30 || processed % 100 === 0) {
+      process.stderr.write(`[pump] #${processed} ${phaseName} ui=${postUi} ready=${phaseReady}\n`);
     }
 
-    // Yield to event loop
-    await new Promise<void>(r => setTimeout(r, 1));
+    // Yield to let async phase callbacks complete.
+    // Uses combination of microtask flushing (for .then() chains) and
+    // macrotask yields (for MockClock setInterval ticks).
+    // Flush microtasks and yield to macrotask queue to let async callbacks complete
+    for (let y = 0; y < 30; y++) {
+      // Multiple microtask flushes per iteration (for nested .then chains)
+      for (let m = 0; m < 5; m++) {
+        await Promise.resolve();
+        if (phaseReady) {
+          break;
+        }
+      }
+      if (phaseReady) {
+        break;
+      }
+      // Yield to macrotask queue (MockClock setInterval ticks)
+      await new Promise<void>(r => setTimeout(r, 1));
+      if (phaseReady) {
+        break;
+      }
+    }
   }
 
   const uiMode = globalScene.ui?.getMode() ?? 0;

@@ -368,6 +368,9 @@ Pokemon.prototype.enableMask = (() => null) as any;
 Pokemon.prototype.updateFusionPalette = (() => null) as any;
 Pokemon.prototype.cry = (() => null) as any;
 Pokemon.prototype.faintCry = ((cb: any) => cb?.()) as any;
+// Mock updateInfo to resolve immediately — the real implementation tweens the HP bar
+// which creates async chains that stall the phase pump.
+Pokemon.prototype.updateInfo = ((_instant?: boolean) => Promise.resolve()) as any;
 // @ts-expect-error
 PokedexMonContainer.prototype.remove = MockContainer.prototype.remove;
 

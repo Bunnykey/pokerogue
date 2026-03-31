@@ -87,8 +87,10 @@ function installPhasePump(): void {
     });
   };
 
+  // Patch Pokemon.prototype.updateInfo — done via patchUpdateInfo() below
+
   pumpInstalled = true;
-  process.stderr.write("[bridge] Phase pump + sync UI installed\n");
+  process.stderr.write("[bridge] Phase pump + sync UI + sync updateInfo installed\n");
 }
 
 /**
@@ -148,15 +150,14 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
     }
     const phaseName = phase.phaseName || phase.constructor.name;
 
-    // Patch DamageAnimPhase to skip flash animation — the flashTimer depends on
-    // MockClock ticks which may not fire reliably in the pump loop.
-    // Patch DamageAnimPhase: skip flash animation, use instant updateInfo
+    // Patch DamageAnimPhase: skip flash animation, call end() directly
     if (phaseName === "DamageAnimPhase") {
       (phase as any).applyDamage = function (this: any) {
         if (this.amount) {
-          globalScene.damageNumberHandler?.add?.(this.getPokemon(), this.amount, this.damageResult, this.critical);
+          try {
+            globalScene.damageNumberHandler?.add?.(this.getPokemon(), this.amount, this.damageResult, this.critical);
+          } catch {}
         }
-        // updateInfo(true) → instant tween → resolve synchronously via mock → .then fires
         this.getPokemon()
           .updateInfo(true)
           .then(() => this.end());
@@ -164,6 +165,7 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
     }
 
     // Force CommandPhase to always prompt the player (clear move queue to prevent auto-skip)
+    // Also patch end() to be synchronous (the async setMode.then chain stalls the pump)
     if (phaseName === "CommandPhase") {
       try {
         const fieldIdx = (phase as any).fieldIndex ?? 0;
@@ -172,6 +174,10 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
           playerPokemon.getMoveQueue().length = 0;
         }
       } catch {}
+      phase.end = () => {
+        (globalScene.ui as any).mode = 0; // UiMode.MESSAGE
+        globalScene.phaseManager.shiftPhase();
+      };
     }
 
     phaseReady = false;
@@ -181,28 +187,16 @@ async function phasePump(maxPhases: number): Promise<{ phases: number; uiMode: n
       process.stderr.write(`[pump] ${phaseName} error: ${e.message}\n`);
     }
     processed++;
-    const postUi = globalScene.ui?.getMode() ?? -1;
-    if (processed <= 30 || processed % 100 === 0) {
-      process.stderr.write(`[pump] #${processed} ${phaseName} ui=${postUi} ready=${phaseReady}\n`);
-    }
 
     // Yield to let async phase callbacks complete.
     // Uses combination of microtask flushing (for .then() chains) and
     // macrotask yields (for MockClock setInterval ticks).
-    // Flush microtasks and yield to macrotask queue to let async callbacks complete
-    for (let y = 0; y < 30; y++) {
-      // Multiple microtask flushes per iteration (for nested .then chains)
-      for (let m = 0; m < 5; m++) {
-        await Promise.resolve();
-        if (phaseReady) {
-          break;
-        }
-      }
-      if (phaseReady) {
-        break;
-      }
-      // Yield to macrotask queue (MockClock setInterval ticks)
-      await new Promise<void>(r => setTimeout(r, 1));
+    // Flush microtasks + yield to macrotask queue
+    // DamageAnimPhase: updateInfo() → Promise.resolve() → .then(end) → shiftPhase → phaseReady
+    // This chain needs: 1 microtask (Promise resolve) + 1 microtask (.then callback)
+    for (let y = 0; y < 15; y++) {
+      // setImmediate fires before setTimeout but after microtasks
+      await new Promise<void>(r => setImmediate(r));
       if (phaseReady) {
         break;
       }
@@ -235,6 +229,15 @@ async function handleCommand(cmd: Command): Promise<Record<string, any>> {
       } catch (e: any) {
         return { ok: false, error: e.message };
       }
+    }
+
+    case "flush": {
+      // Flush microtasks — lets pending .then() callbacks execute
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise<void>(r => setTimeout(r, 1));
+      return { ok: true };
     }
 
     case "tick": {
